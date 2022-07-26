@@ -1,19 +1,27 @@
-from datetime import datetime
+from datetime import datetime,timedelta
 from typing import Optional
 import databases
 import enum
+import jwt
 import sqlalchemy
 from pydantic import BaseModel, validator
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from decouple import config
 from email_validator import validate_email as validate_e
 from passlib.context import CryptContext
+from fastapi.security import HTTPBearer,HTTPAuthorizationCredentials
+from starlette.requests import Request
 
 DATABASE_URL = "sqlite:///./clothes.db"
 
 database = databases.Database(DATABASE_URL)
 
 metadata = sqlalchemy.MetaData()
+
+class UserRole(enum.Enum):
+    super_admin = "super_admin"
+    admin = "admin"
+    user = "user"
 
 users = sqlalchemy.Table(
     "users",
@@ -31,6 +39,7 @@ users = sqlalchemy.Table(
         server_default=sqlalchemy.func.now(),
         onupdate=sqlalchemy.func.now(),
     ),
+    sqlalchemy.Column("role", sqlalchemy.Enum(UserRole), nullable=False, server_default=UserRole.user.name),
 )
 
 
@@ -48,6 +57,7 @@ class SizeEnum(enum.Enum):
     l = "l"
     xl = "xl"
     xxl = "xxl"
+    
 
 clothes = sqlalchemy.Table(
     "clothes",
@@ -65,6 +75,7 @@ clothes = sqlalchemy.Table(
         server_default=sqlalchemy.func.now(),
         onupdate=sqlalchemy.func.now(),
     ),
+    
 )
 class EmailField(str):
     @classmethod
@@ -118,7 +129,32 @@ class UserSignOut(BaseUser):
 app = FastAPI()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+class CustomHttpBearer(HTTPBearer):
+    async def __call__(
+        self, request: Request
+        ) -> Optional[HTTPAuthorizationCredentials]:
+        
+        res = await super().__call__(request)
+        try:
+            payload = jwt.decode(res.credentials, config("SECRET_KEY"), algorithms=["HS256"])
+            user = await database.fetch_one( users.select().where(users.c.id == payload["sub"]))
+            request.state.user = user
+            print(request.state.user['email'])
+            return payload
+        except Exception as e:
+            raise e
+    
 
+oauth2_scheme = CustomHttpBearer()    
+
+def create_access_token(user):
+    try :
+        payload = {'sub':user['id'],'exp':datetime.utcnow() + timedelta(minutes=60)}
+        return jwt.encode(payload, 'b6995d25-11ef-40d0-89f3-1c7de1a3a3af', algorithm='HS256')
+    except Exception as e:
+        raise e
+    
+    
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -129,12 +165,18 @@ async def shutdown():
     await database.disconnect()
     
     
-@app.post("/register/", response_model=UserSignOut)
+@app.get("/clothes/",dependencies=[Depends(oauth2_scheme)])
+async def get_all_clothes():
+    return await database.fetch_all(clothes.select())
+    
+@app.post("/register/",) # remove  response_model=UserSignOut when call token 
 async def create_user(user:UserSignIn):
     user.password = pwd_context.hash(user.password)
     q = users.insert().values(**user.dict())
     id_ = await database.execute(q)
     user = await database.fetch_one(users.select().where(users.c.id == id_))
-    return user
+    token = create_access_token(user)
+    
+    return {"token":token}
     
     
